@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local auth session
+session_cookies.json
+config.json
+download_history.json
+kpics_karina.html
+kpics_page.js
+karina_kpics.json
+album.html

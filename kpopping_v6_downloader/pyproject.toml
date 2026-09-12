@@ -1,0 +1,19 @@
+[project]
+name = "kpopping-v6-downloader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "LoveWonYoung", email = "168514731+LoveWonYoung@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "curl-cffi>=0.13.0",
+]
+
+[project.scripts]
+kpopping-v6-downloader = "kpopping_v6_downloader:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
