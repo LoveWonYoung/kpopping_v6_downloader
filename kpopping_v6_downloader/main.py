@@ -10,7 +10,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable
@@ -32,6 +32,8 @@ REQUEST_TIMEOUT = 60
 MAX_RATE_LIMIT_RETRIES = 5
 DEFAULT_DOWNLOAD_WORKERS = 4
 MAX_DOWNLOAD_WORKERS = 16
+DEFAULT_RECENT_DAYS = 7
+MAX_RECENT_DAYS = 3650
 
 DEFAULT_IDOL_ID = "077c4f02-7ca6-49a6-9daf-df1dabc55d0f"
 DEFAULT_IDOL_NAME = "Karina"
@@ -64,6 +66,13 @@ class DownloadResult:
     output_dir: Path
 
 
+@dataclass(frozen=True)
+class BatchDownloadResult:
+    total_idols: int
+    results: tuple[DownloadResult, ...]
+    failures: tuple[tuple[str, str], ...]
+
+
 def write_json_file(path: Path, data: object) -> None:
     """原子写入 JSON，避免程序退出时留下半个文件。"""
     temp_file = path.with_name(path.name + ".tmp")
@@ -76,6 +85,46 @@ def write_json_file(path: Path, data: object) -> None:
     except Exception:
         temp_file.unlink(missing_ok=True)
         raise
+
+
+def normalize_saved_idols(value: object) -> list[dict[str, str]]:
+    """清理配置中的 Idol 列表，并按 ID 去重。"""
+    if not isinstance(value, list):
+        return []
+
+    saved_idols: list[dict[str, str]] = []
+    positions: dict[str, int] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        idol_id = item.get("id")
+        idol_name = item.get("name")
+        if not isinstance(idol_id, str) or not isinstance(idol_name, str):
+            continue
+        idol_id = idol_id.strip()
+        idol_name = idol_name.strip()
+        if not idol_id or not idol_name:
+            continue
+        normalized = {"name": idol_name, "id": idol_id}
+        if idol_id in positions:
+            saved_idols[positions[idol_id]] = normalized
+        else:
+            positions[idol_id] = len(saved_idols)
+            saved_idols.append(normalized)
+    return saved_idols
+
+
+def upsert_saved_idol(
+    saved_idols: list[dict[str, str]], idol_id: str, idol_name: str
+) -> list[dict[str, str]]:
+    """按 ID 更新名称；新 ID 追加到下拉列表末尾。"""
+    updated = [dict(item) for item in saved_idols]
+    for item in updated:
+        if item["id"] == idol_id:
+            item["name"] = idol_name
+            return updated
+    updated.append({"name": idol_name, "id": idol_id})
+    return updated
 
 
 class DownloadHistory:
@@ -149,6 +198,73 @@ def retry_after_seconds(value: str | None) -> int:
             return 60
 
 
+def parse_album_date(album: dict) -> date | None:
+    """读取图集上传日期，并为缺少上传时间的旧数据提供降级解析。"""
+    created_at = album.get("createdAt")
+    if isinstance(created_at, str):
+        try:
+            created_datetime = datetime.fromisoformat(
+                created_at.strip().removeprefix("$D").replace("Z", "+00:00")
+            )
+            if created_datetime.tzinfo is not None:
+                created_datetime = created_datetime.astimezone()
+            return created_datetime.date()
+        except ValueError:
+            pass
+
+    # 新图的文件名以毫秒时间戳开头，通常与相册创建时间相差不到几秒。
+    src = album.get("src")
+    if isinstance(src, str):
+        match = re.search(r"/(\d{13})-[^/]+$", urlparse(src).path)
+        if match:
+            try:
+                return datetime.fromtimestamp(
+                    int(match.group(1)) / 1000, timezone.utc
+                ).astimezone().date()
+            except (OSError, OverflowError, ValueError):
+                pass
+
+    # 旧列表可能没有 createdAt，最后再按拍摄日期或标题日期判断。
+    photo_date = album.get("photoDate")
+    if isinstance(photo_date, str):
+        normalized = photo_date.strip()
+        try:
+            return date.fromisoformat(normalized[:10])
+        except ValueError:
+            digits = re.sub(r"\D", "", normalized)
+            if len(digits) == 6:
+                year = int(digits[:2])
+                year += 2000 if year < 50 else 1900
+                try:
+                    return date(year, int(digits[2:4]), int(digits[4:6]))
+                except ValueError:
+                    pass
+            elif len(digits) == 8:
+                try:
+                    return date(
+                        int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+                    )
+                except ValueError:
+                    pass
+
+    for key in ("title", "slug"):
+        value = album.get(key)
+        if not isinstance(value, str):
+            continue
+        match = re.search(r"(?<!\d)(\d{6})(?!\d)", value)
+        if not match:
+            continue
+        compact = match.group(1)
+        year = int(compact[:2])
+        year += 2000 if year < 50 else 1900
+        try:
+            return date(year, int(compact[2:4]), int(compact[4:6]))
+        except ValueError:
+            continue
+
+    return None
+
+
 def auth_token_is_expired(token: str) -> bool:
     """只读取 JWT 的 exp，签名仍由服务端验证。无法解析时交给服务端处理。"""
     try:
@@ -179,6 +295,7 @@ class KpoppingDownloader:
         idol_id: str,
         idol_name: str,
         sort: str,
+        recent_days: int,
         download_workers: int,
         output_dir: Path,
         stop_event: threading.Event,
@@ -191,6 +308,7 @@ class KpoppingDownloader:
         self.idol_id = idol_id
         self.idol_name = idol_name
         self.sort = sort
+        self.recent_days = max(0, min(recent_days, MAX_RECENT_DAYS))
         self.download_workers = max(
             1, min(download_workers, MAX_DOWNLOAD_WORKERS)
         )
@@ -330,6 +448,14 @@ class KpoppingDownloader:
         seen_slugs: set[str] = set()
         offset = 0
         referer = f"{BASE_URL}/kpics?idol={self.idol_id}&idolName={self.idol_name}"
+        cutoff = None
+        request_sort = self.sort
+        if self.recent_days:
+            cutoff = date.today() - timedelta(days=self.recent_days - 1)
+            request_sort = "date"
+            self.log(
+                f"只扫描最近 {self.recent_days} 天的图集（{cutoff.isoformat()} 起）"
+            )
 
         while True:
             self.check_cancelled()
@@ -341,7 +467,7 @@ class KpoppingDownloader:
                     "idolId": self.idol_id,
                     "limit": PAGE_SIZE,
                     "offset": offset,
-                    "sort": self.sort,
+                    "sort": request_sort,
                 },
                 headers={"referer": referer},
             )
@@ -354,17 +480,29 @@ class KpoppingDownloader:
                 raise ValueError("图集列表接口返回了非数组数据")
 
             new_count = 0
+            found_older_album = False
             for album in page:
                 if not isinstance(album, dict):
                     continue
                 slug = album.get("slug")
                 if slug and slug not in seen_slugs:
                     seen_slugs.add(slug)
-                    albums.append(album)
                     new_count += 1
-            self.log(f"当前已找到 {len(albums)} 个图集")
+                    if cutoff is not None:
+                        album_date = parse_album_date(album)
+                        if album_date is not None and album_date < cutoff:
+                            found_older_album = True
+                            continue
+                    albums.append(album)
+            if cutoff is None:
+                self.log(f"当前已找到 {len(albums)} 个图集")
+            else:
+                self.log(f"当前已找到 {len(albums)} 个最近图集")
 
             if len(page) < PAGE_SIZE:
+                break
+            if found_older_album:
+                self.log("当前页已进入早于扫描范围的图集，停止继续翻页")
                 break
             if new_count == 0:
                 self.log("接口返回了重复分页，停止继续翻页")
@@ -424,12 +562,24 @@ class KpoppingDownloader:
     def _run(self) -> DownloadResult:
         self.ensure_login()
         albums = self.fetch_all_albums()
-        if not albums:
-            raise RuntimeError("没有找到图集，请检查 Idol ID")
-
         idol_dir = self.output_dir / safe_name(
             self.idol_name or self.idol_id, fallback="idol"
         )
+        if not albums:
+            if not self.recent_days:
+                raise RuntimeError("没有找到图集，请检查 Idol ID")
+            self.log(
+                f"最近 {self.recent_days} 天内没有找到图集，请同时确认 Idol ID"
+            )
+            return DownloadResult(
+                albums=0,
+                history_skipped_albums=0,
+                downloaded=0,
+                skipped=0,
+                failed=0,
+                output_dir=idol_dir,
+            )
+
         idol_dir.mkdir(parents=True, exist_ok=True)
         self.log(f"共找到 {len(albums)} 个图集，开始读取图片并下载")
 
@@ -551,7 +701,18 @@ class DownloaderApp(tk.Tk):
         self.idol_name_var = tk.StringVar(
             value=config.get("idol_name", DEFAULT_IDOL_NAME)
         )
+        self.saved_idol_var = tk.StringVar()
+        self.saved_idols = normalize_saved_idols(config.get("saved_idols"))
+        current_idol_id = str(config.get("idol_id", "")).strip()
+        current_idol_name = str(config.get("idol_name", "")).strip()
+        if current_idol_id and current_idol_name:
+            self.saved_idols = upsert_saved_idol(
+                self.saved_idols, current_idol_id, current_idol_name
+            )
         self.sort_var = tk.StringVar(value=config.get("sort", "hot"))
+        self.recent_days_var = tk.StringVar(
+            value=str(config.get("recent_days", DEFAULT_RECENT_DAYS))
+        )
         self.workers_var = tk.StringVar(
             value=str(config.get("download_workers", DEFAULT_DOWNLOAD_WORKERS))
         )
@@ -581,17 +742,28 @@ class DownloaderApp(tk.Tk):
                 "device_fingerprint",
                 "idol_id",
                 "idol_name",
+                "saved_idols",
                 "sort",
+                "recent_days",
                 "download_workers",
                 "output_dir",
             }
             config = {key: value for key, value in data.items() if key in allowed}
+            config["saved_idols"] = normalize_saved_idols(
+                config.get("saved_idols")
+            )
             if config.get("sort") not in (None, "hot", "date"):
                 config.pop("sort", None)
             workers = config.get("download_workers")
             if not isinstance(workers, int) or not 1 <= workers <= MAX_DOWNLOAD_WORKERS:
                 config.pop("download_workers", None)
-            for key in allowed - {"download_workers"}:
+            recent_days = config.get("recent_days")
+            if (
+                not isinstance(recent_days, int)
+                or not 0 <= recent_days <= MAX_RECENT_DAYS
+            ):
+                config.pop("recent_days", None)
+            for key in allowed - {"download_workers", "recent_days", "saved_idols"}:
                 if key in config and not isinstance(config[key], str):
                     config.pop(key)
             return config, None
@@ -602,7 +774,7 @@ class DownloaderApp(tk.Tk):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(8, weight=1)
+        outer.rowconfigure(10, weight=1)
 
         ttk.Label(outer, text="账号 / 邮箱").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.email_var).grid(
@@ -619,17 +791,31 @@ class DownloaderApp(tk.Tk):
             row=2, column=1, columnspan=2, sticky="ew", pady=4
         )
 
-        ttk.Label(outer, text="Idol ID").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Entry(outer, textvariable=self.idol_id_var).grid(
+        ttk.Label(outer, text="已保存 Idol").grid(
+            row=3, column=0, sticky="w", pady=4
+        )
+        self.saved_idol_combo = ttk.Combobox(
+            outer,
+            textvariable=self.saved_idol_var,
+            state="readonly",
+        )
+        self.saved_idol_combo.grid(
             row=3, column=1, columnspan=2, sticky="ew", pady=4
         )
+        self.saved_idol_combo.bind("<<ComboboxSelected>>", self.select_saved_idol)
+        self.refresh_saved_idols(self.idol_id_var.get().strip())
 
-        ttk.Label(outer, text="Idol 名称").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(outer, text="Idol ID").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(outer, textvariable=self.idol_id_var).grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=4
+        )
+
+        ttk.Label(outer, text="Idol 名称").grid(row=5, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.idol_name_var).grid(
-            row=4, column=1, sticky="ew", pady=4
+            row=5, column=1, sticky="ew", pady=4
         )
         sort_frame = ttk.Frame(outer)
-        sort_frame.grid(row=4, column=2, sticky="e", padx=(12, 0))
+        sort_frame.grid(row=5, column=2, sticky="e", padx=(12, 0))
         ttk.Label(sort_frame, text="排序").pack(side="left", padx=(0, 6))
         ttk.Combobox(
             sort_frame,
@@ -647,23 +833,45 @@ class DownloaderApp(tk.Tk):
             width=4,
         ).pack(side="left")
 
-        ttk.Label(outer, text="保存目录").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Label(outer, text="扫描范围").grid(row=6, column=0, sticky="w", pady=4)
+        range_frame = ttk.Frame(outer)
+        range_frame.grid(row=6, column=1, columnspan=2, sticky="w", pady=4)
+        ttk.Label(range_frame, text="最近").pack(side="left")
+        ttk.Spinbox(
+            range_frame,
+            textvariable=self.recent_days_var,
+            from_=0,
+            to=MAX_RECENT_DAYS,
+            width=6,
+        ).pack(side="left", padx=6)
+        ttk.Label(range_frame, text="天（0 = 全部；默认 7 天）").pack(side="left")
+
+        ttk.Label(outer, text="保存目录").grid(row=7, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.output_var).grid(
-            row=5, column=1, sticky="ew", pady=4
+            row=7, column=1, sticky="ew", pady=4
         )
         ttk.Button(outer, text="选择…", command=self.choose_output).grid(
-            row=5, column=2, sticky="e", padx=(12, 0), pady=4
+            row=7, column=2, sticky="e", padx=(12, 0), pady=4
         )
 
         hint = "已有 session_cookies.json 且含 auth_token 时可不填账号和密码。"
         ttk.Label(outer, text=hint, foreground="#666666").grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(2, 10)
+            row=8, column=0, columnspan=3, sticky="w", pady=(2, 10)
         )
 
         actions = ttk.Frame(outer)
-        actions.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        self.start_button = ttk.Button(actions, text="开始下载", command=self.start_download)
+        actions.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        self.start_button = ttk.Button(
+            actions, text="下载当前 Idol", command=self.start_download
+        )
         self.start_button.pack(side="left")
+        self.start_all_button = ttk.Button(
+            actions,
+            text="下载全部 Idol",
+            command=self.start_download_all,
+            state="normal" if self.saved_idols else "disabled",
+        )
+        self.start_all_button.pack(side="left", padx=(8, 0))
         self.cancel_button = ttk.Button(
             actions, text="取消", command=self.cancel_download, state="disabled"
         )
@@ -675,7 +883,7 @@ class DownloaderApp(tk.Tk):
         ttk.Label(actions, textvariable=self.status_var).pack(side="left", padx=8)
 
         log_frame = ttk.LabelFrame(outer, text="运行日志", padding=8)
-        log_frame.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        log_frame.grid(row=10, column=0, columnspan=3, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = tk.Text(log_frame, height=16, wrap="word", state="disabled")
@@ -685,7 +893,33 @@ class DownloaderApp(tk.Tk):
         scrollbar.grid(row=0, column=1, sticky="ns")
 
         self.progress = ttk.Progressbar(outer, mode="determinate")
-        self.progress.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.progress.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+
+    @staticmethod
+    def saved_idol_label(idol: dict[str, str]) -> str:
+        return f'{idol["name"]} — {idol["id"]}'
+
+    def refresh_saved_idols(self, selected_id: str = "") -> None:
+        self.saved_idol_combo.configure(
+            values=tuple(self.saved_idol_label(idol) for idol in self.saved_idols)
+        )
+        if hasattr(self, "start_all_button") and self.worker is None:
+            self.start_all_button.configure(
+                state="normal" if self.saved_idols else "disabled"
+            )
+        selected = next(
+            (idol for idol in self.saved_idols if idol["id"] == selected_id),
+            None,
+        )
+        self.saved_idol_var.set(self.saved_idol_label(selected) if selected else "")
+
+    def select_saved_idol(self, _event: tk.Event | None = None) -> None:
+        selected_label = self.saved_idol_var.get()
+        for idol in self.saved_idols:
+            if self.saved_idol_label(idol) == selected_label:
+                self.idol_name_var.set(idol["name"])
+                self.idol_id_var.set(idol["id"])
+                return
 
     def choose_output(self) -> None:
         selected = filedialog.askdirectory(
@@ -704,21 +938,37 @@ class DownloaderApp(tk.Tk):
     def save_config(self) -> None:
         try:
             download_workers = int(self.workers_var.get())
+            recent_days = int(self.recent_days_var.get())
         except ValueError:
-            messagebox.showwarning("参数错误", "图片并发数必须是整数")
+            messagebox.showwarning("参数错误", "图片并发数和最近天数必须是整数")
             return
         if not 1 <= download_workers <= MAX_DOWNLOAD_WORKERS:
             messagebox.showwarning(
                 "参数错误", f"图片并发数必须在 1–{MAX_DOWNLOAD_WORKERS} 之间"
             )
             return
+        if not 0 <= recent_days <= MAX_RECENT_DAYS:
+            messagebox.showwarning(
+                "参数错误", f"最近天数必须在 0–{MAX_RECENT_DAYS} 之间"
+            )
+            return
+
+        idol_id = self.idol_id_var.get().strip()
+        idol_name = self.idol_name_var.get().strip()
+        saved_current_idol = bool(idol_id and idol_name)
+        if saved_current_idol:
+            self.saved_idols = upsert_saved_idol(
+                self.saved_idols, idol_id, idol_name
+            )
 
         config = {
             "email": self.email_var.get().strip(),
             "device_fingerprint": self.fingerprint_var.get().strip(),
-            "idol_id": self.idol_id_var.get().strip(),
-            "idol_name": self.idol_name_var.get().strip(),
+            "idol_id": idol_id,
+            "idol_name": idol_name,
+            "saved_idols": self.saved_idols,
             "sort": self.sort_var.get(),
+            "recent_days": recent_days,
             "download_workers": download_workers,
             "output_dir": self.output_var.get().strip(),
         }
@@ -727,47 +977,96 @@ class DownloaderApp(tk.Tk):
         except OSError as exc:
             messagebox.showerror("保存失败", f"配置保存失败：{exc}")
             return
+        self.refresh_saved_idols(idol_id)
         self.append_log(f"配置已保存到 {CONFIG_FILE.name}（不包含密码）")
-        messagebox.showinfo("保存配置", "配置已保存。为安全起见，密码不会保存。")
+        idol_message = (
+            "当前 Idol 已加入下拉列表。"
+            if saved_current_idol
+            else "当前 Idol 的名称或 ID 为空，未加入下拉列表。"
+        )
+        messagebox.showinfo(
+            "保存配置",
+            f"配置已保存；{idol_message}为安全起见，密码不会保存。",
+        )
 
-    def start_download(self) -> None:
-        idol_id = self.idol_id_var.get().strip()
+    def get_common_download_settings(self) -> dict | None:
         output_text = self.output_var.get().strip()
-        if not idol_id:
-            messagebox.showwarning("缺少参数", "请填写 Idol ID")
-            return
         if not output_text:
             messagebox.showwarning("缺少参数", "请选择保存目录")
-            return
+            return None
         try:
             download_workers = int(self.workers_var.get())
+            recent_days = int(self.recent_days_var.get())
         except ValueError:
-            messagebox.showwarning("参数错误", "图片并发数必须是整数")
-            return
+            messagebox.showwarning("参数错误", "图片并发数和最近天数必须是整数")
+            return None
         if not 1 <= download_workers <= MAX_DOWNLOAD_WORKERS:
             messagebox.showwarning(
                 "参数错误", f"图片并发数必须在 1–{MAX_DOWNLOAD_WORKERS} 之间"
             )
-            return
+            return None
+        if not 0 <= recent_days <= MAX_RECENT_DAYS:
+            messagebox.showwarning(
+                "参数错误", f"最近天数必须在 0–{MAX_RECENT_DAYS} 之间"
+            )
+            return None
 
-        self.stop_event.clear()
-        self.progress.configure(value=0, maximum=1)
-        self.start_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
-        self.status_var.set("正在准备……")
-
-        settings = {
+        return {
             "email": self.email_var.get().strip(),
             "password": self.password_var.get(),
             "device_fingerprint": self.fingerprint_var.get().strip(),
-            "idol_id": idol_id,
-            "idol_name": self.idol_name_var.get().strip(),
             "sort": self.sort_var.get(),
+            "recent_days": recent_days,
             "download_workers": download_workers,
             "output_dir": Path(output_text).expanduser(),
         }
+
+    def begin_run(self, status: str) -> None:
+        self.stop_event.clear()
+        self.progress.configure(value=0, maximum=1)
+        self.start_button.configure(state="disabled")
+        self.start_all_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+        self.status_var.set(status)
+
+    def start_download(self) -> None:
+        idol_id = self.idol_id_var.get().strip()
+        if not idol_id:
+            messagebox.showwarning("缺少参数", "请填写 Idol ID")
+            return
+
+        common_settings = self.get_common_download_settings()
+        if common_settings is None:
+            return
+
+        settings = {
+            **common_settings,
+            "idol_id": idol_id,
+            "idol_name": self.idol_name_var.get().strip(),
+        }
+        self.begin_run("正在准备……")
         self.worker = threading.Thread(
             target=self.download_worker, args=(settings,), daemon=True
+        )
+        self.worker.start()
+
+    def start_download_all(self) -> None:
+        if not self.saved_idols:
+            messagebox.showwarning(
+                "没有已保存 Idol", "请先填写 Idol 名称和 ID，然后点击“保存配置”"
+            )
+            return
+
+        common_settings = self.get_common_download_settings()
+        if common_settings is None:
+            return
+
+        idols = tuple(dict(idol) for idol in self.saved_idols)
+        self.begin_run(f"正在准备批量下载（共 {len(idols)} 个 Idol）……")
+        self.worker = threading.Thread(
+            target=self.download_all_worker,
+            args=(common_settings, idols),
+            daemon=True,
         )
         self.worker.start()
 
@@ -783,6 +1082,75 @@ class DownloaderApp(tk.Tk):
             )
             result = downloader.run()
             self.events.put(("done", result))
+        except DownloadCancelled:
+            self.events.put(("cancelled", None))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    def download_all_worker(
+        self, common_settings: dict, idols: tuple[dict[str, str], ...]
+    ) -> None:
+        results: list[DownloadResult] = []
+        failures: list[tuple[str, str]] = []
+        total_idols = len(idols)
+        try:
+            for idol_index, idol in enumerate(idols, start=1):
+                if self.stop_event.is_set():
+                    raise DownloadCancelled
+
+                idol_name = idol["name"]
+                self.events.put(
+                    (
+                        "log",
+                        f"===== [{idol_index}/{total_idols}] 开始处理 {idol_name} =====",
+                    )
+                )
+                settings = {
+                    **common_settings,
+                    "idol_id": idol["id"],
+                    "idol_name": idol_name,
+                }
+                try:
+                    downloader = KpoppingDownloader(
+                        **settings,
+                        stop_event=self.stop_event,
+                        log=lambda message: self.events.put(("log", message)),
+                        album_progress=lambda current, total, index=idol_index: (
+                            self.events.put(
+                                (
+                                    "batch_progress",
+                                    (index, total_idols, current, total),
+                                )
+                            )
+                        ),
+                    )
+                    results.append(downloader.run())
+                    self.events.put(("log", f"{idol_name} 处理完成"))
+                except DownloadCancelled:
+                    raise
+                except Exception as exc:
+                    failures.append((idol_name, str(exc)))
+                    self.events.put(
+                        ("log", f"{idol_name} 处理失败，继续下一个：{exc}")
+                    )
+                finally:
+                    self.events.put(
+                        (
+                            "batch_progress",
+                            (idol_index, total_idols, 1, 1),
+                        )
+                    )
+
+            self.events.put(
+                (
+                    "batch_done",
+                    BatchDownloadResult(
+                        total_idols=total_idols,
+                        results=tuple(results),
+                        failures=tuple(failures),
+                    ),
+                )
+            )
         except DownloadCancelled:
             self.events.put(("cancelled", None))
         except Exception as exc:
@@ -804,6 +1172,15 @@ class DownloaderApp(tk.Tk):
                 elif kind == "progress":
                     current, total = payload  # type: ignore[misc]
                     self.progress.configure(maximum=max(1, total), value=current)
+                elif kind == "batch_progress":
+                    idol_index, total_idols, current, total = (  # type: ignore[misc]
+                        payload
+                    )
+                    fraction = min(1.0, current / max(1, total))
+                    self.progress.configure(
+                        maximum=max(1, total_idols),
+                        value=(idol_index - 1) + fraction,
+                    )
                 elif kind == "done":
                     result = payload
                     assert isinstance(result, DownloadResult)
@@ -819,6 +1196,40 @@ class DownloaderApp(tk.Tk):
                     self.status_var.set("下载完成")
                     self.append_log(summary.replace("\n", "；"))
                     messagebox.showinfo("下载完成", summary)
+                elif kind == "batch_done":
+                    result = payload
+                    assert isinstance(result, BatchDownloadResult)
+                    self.finish_run()
+                    albums = sum(item.albums for item in result.results)
+                    history_skipped = sum(
+                        item.history_skipped_albums for item in result.results
+                    )
+                    downloaded = sum(item.downloaded for item in result.results)
+                    skipped = sum(item.skipped for item in result.results)
+                    failed_images = sum(item.failed for item in result.results)
+                    summary = (
+                        f"Idol 总数：{result.total_idols}\n"
+                        f"成功：{len(result.results)}\n"
+                        f"失败：{len(result.failures)}\n"
+                        f"处理图集：{albums}\n"
+                        f"历史记录跳过图集：{history_skipped}\n"
+                        f"新下载：{downloaded}\n"
+                        f"已跳过：{skipped}\n"
+                        f"图片/图集失败：{failed_images}"
+                    )
+                    if result.failures:
+                        failure_details = "\n".join(
+                            f"- {name}：{error}"
+                            for name, error in result.failures
+                        )
+                        summary += f"\n\n失败明细：\n{failure_details}"
+                        self.status_var.set("批量下载完成，部分 Idol 失败")
+                        show_result = messagebox.showwarning
+                    else:
+                        self.status_var.set("全部 Idol 下载完成")
+                        show_result = messagebox.showinfo
+                    self.append_log(summary.replace("\n", "；"))
+                    show_result("批量下载完成", summary)
                 elif kind == "cancelled":
                     self.finish_run()
                     self.status_var.set("已取消")
@@ -835,6 +1246,9 @@ class DownloaderApp(tk.Tk):
 
     def finish_run(self) -> None:
         self.start_button.configure(state="normal")
+        self.start_all_button.configure(
+            state="normal" if self.saved_idols else "disabled"
+        )
         self.cancel_button.configure(state="disabled")
         self.worker = None
 
